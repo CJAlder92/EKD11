@@ -1,0 +1,679 @@
+---
+title: "EKD11 Analysis"
+author: "Chris Alder"
+date: "08/11/2019"
+output:
+  html_document:
+      toc: true
+      number_sections: true
+      toc_float: true
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+The Aim of the EKD11 timecourse experiment is to investigate the host's immune response to a primary _P.chabaudi AS_ infection transmitted through different routes; Natural transmission (Mosquito), serially blood passaged (SBP), and recently transmissited blood passage (RTMT). The timecourse looks at the acute phase of the infection, using transcriptomics data taken from days 1, 2, 3, 4 and 6.
+
+
+# Pre-requisites
+
+Loading the required R library packages and setting the directories for the project analysis
+```{r workspace, include=FALSE}
+source('/Users/alderc/1-projects/1-PIR_project/3-EKD11_AS_Early_TP/1-R/1-R_scripts/packages.R')
+
+## Directories
+nf.dir      <- "/Users/alderc/1-projects/CAMP/1-AS_timecourse/2-EKD11/1-Pipeline/1-Nextflow/";
+work.dir    <- "/Users/alderc/1-projects/1-PIR_project/3-EKD11_AS_Early_TP/";
+r.dir       <- paste(work.dir, "1-R/1-R_scripts/",sep='');
+tmp.dir     <- paste(work.dir,"tmp/",sep='');
+data.dir    <- paste(work.dir,"4-data/",sep='');
+results.dir <- paste(work.dir,"2-results/",sep='')
+
+for (dir in grep("\\.dir$",ls(),value=T)) {
+  if (!file.exists(get(dir))) { dir.create(get(dir),recursive=TRUE, mode="0755"); }
+}
+```
+# Experimental setup
+
+## Loading Genome data
+
+Importing GTF file containing genome information for Mus musculus. GRCm38 version 86
+
+```{r gtf, include=FALSE}
+genome.dir <- "~/1-projects/9-Data/1-Reference_genomes/1-Mus_musculus/";
+genome     <- "GRCm38";
+gtf.file   <- paste(genome.dir,"Mus_musculus.GRCm38.86.gtf",sep='');
+gtf.meta    <- import(gtf.file);
+gtf.dat    <- as.data.frame(gtf.meta[gtf.meta$type %in% "gene",]);
+gtf.dat$GRCm38 <- paste("chr",gtf.dat$seqnames,":",gtf.dat$start,"-",gtf.dat$end,sep='');
+rownames(gtf.dat) <- gtf.dat$gene_id;
+```
+
+## Design file
+
+This is a file containing all the meta data we need for the data analysis. The important factors for the analysis are: sample, day, delivery, replicate and grp (group)
+
+
+```{r design, echo=FALSE}
+design.file <- paste(nf.dir,"design.csv",sep='');
+design      <- read.delim(design.file,header=TRUE,sep=",", stringsAsFactors = TRUE);
+rownames(design) <- design$label;
+#sets naive to be first level of delivery
+design$delivery  <- relevel(design$delivery,"naive");
+#orders days in numerical order
+design$day       <- factor(as.character(design$day),levels=as.character(sort(unique(design$day))));
+design$replicate <- as.factor(design$replicate)
+
+# create a copy of column grp2 and removes .day from naive set so relevel will order all naive as first
+design$grp2      <- factor(sub("naive.*","naive",as.character(design$grp)));
+design$grp2      <- relevel(design$grp2,"naive");
+
+paged_table(design[ ,c(1,7:11)] , options = list(rows.print = 20))
+
+```
+
+## Importing count data and normalisation
+
+This section will import the results of the RNA-seq pipeline and normalise the data according to library size. A count, log(counts) and TPM data frame will then we created from the normalised results.
+
+Below is the TPM database from the experiment, calculated from RSEM.  
+```{r counts, echo = FALSE}
+txi <- tximport(paste(nf.dir,"results/rsem/",design$lims.name,".genes.results",sep=''), type="rsem")
+txi$length[txi$length==0] <- 1
+
+## Create DESeq2 object
+dat <- DESeqDataSetFromTximport(txi, design, ~ grp) # To make Full rank model - Testing with controls removed to check for changes
+rowData(dat) <- gtf.dat[rownames(dat),c("gene_id","gene_name","gene_source","gene_biotype","GRCm38")];
+
+## Normalise / scale and stabilise variance
+dds <- DESeq(dat);
+vsd <- vst(dat, blind = TRUE);
+
+
+#TPM function
+tpm.calc <- function(counts) {
+  gene.lengths <- gene.len[rownames(counts), 'length'] /1000
+  x <- counts/gene.lengths
+  return(t(t(x)*1e6/colSums(x)))
+}
+
+# Count, rlog and TPM data frames
+count.norm  <- counts(dds,normalized=TRUE);
+counts.df <- as.data.frame(count.norm)
+vsd.db <- assay(vsd);
+tpm.db <- as.data.frame(txi$abundance)
+names(tpm.db) <- names(counts.df)
+
+paged_table(tpm.db, options = list(rows.print = 10))
+```
+
+
+#PCA Plot 
+
+PCA plot showing the separation of all samples within the study. The PCA is produced using top 1000 variable genes within the dataset.
+
+```{r pca-3d}
+
+rv <- rowVars(assay(vsd))
+select <- order(rv, decreasing = TRUE)[1:1000]
+
+pca <- prcomp(t(assay(vsd)[select, ]))
+pca.sum <- summary(pca)
+pca.val <- pca.sum$importance[2,1:3]
+pca.df <- as.data.frame(pca$x[,1:3])
+pca.df <- cbind(pca.df, design[rownames(pca.df), c("delivery", "day", "grp", "label")])
+pca.cols <- c("mosquito" = "firebrick", "blood" = "darkblue", "naive" = "#E69F00", 'recent_blood' = 'forestgreen')
+
+p <- plot_ly(data = pca.df) %>%
+  add_trace(type = "scatter3d",
+            x = ~PC1, y = ~PC2, z = ~PC3,
+            color = ~delivery, colors = pca.cols,
+            symbols = c("1" = "circle", "2" = "cross", "3" = "x", "4" = "square", "6" = "diamond"),
+            text = ~label,
+            mode = "markers",
+            marker = list(size = 3)) %>% 
+  add_trace(type = "scatter3d",
+            x = ~PC1, y = ~PC2, z = ~PC3,
+            symbol = ~day,
+            mode = "markers",
+            text = ~label,
+            marker = list(color = "grey")) %>% 
+  add_trace(type = "scatter3d",
+            x = ~PC1, y = ~PC2, z = ~PC3,
+            color = ~delivery,
+            symbol = ~day,
+            mode = "markers",
+            text = ~label,
+            showlegend = F) %>% 
+            layout(scene = list(xaxis = list(title = paste("PC1:", round(pca.val[[1]], 2)*100, "%", sep = " ")),
+                                yaxis = list(title = paste("PC2:", round(pca.val[[2]], 2)*100, "%", sep = " ")),
+                                zaxis = list(title = paste("PC2:", round(pca.val[[3]], 2)*100, "%", sep = " "))))
+
+# p
+```
+
+I've made the PCA in a 3D scatter plot to try and see if there is any separation of the samples before day 3 from PC3 that doesn't seem to appear when using just PC1 and PC2. PC3 only accounts for ~14% of the variance in the dataset, so I wasn't expecting a large change, nonetheless I think the separation it does show is worth keeping. I've also added 2D plots of PC1 vs PC2, PC1 vs PC3 and PC2 vs PC3, which may be more useful. 
+
+```{r pca-1}
+p.1 <- plot_ly(data = pca.df) %>%
+  add_trace(type = "scatter",
+            x = ~PC1, y = ~PC2,
+            color = ~delivery, colors = pca.cols,
+            symbols = c("1" = "circle", "2" = "cross", "3" = "x", "4" = "square", "6" = "diamond"),
+            text = ~label,
+            mode = "markers") %>% 
+  add_trace(type = "scatter",
+            x = ~PC1, y = ~PC2,
+            symbol = ~day,
+            mode = "markers",
+            text = ~label,
+            marker = list(color = "grey", size = 8)) %>% 
+  add_trace(type = "scatter",
+            x = ~PC1, y = ~PC2,
+            color = ~delivery,
+            symbol = ~day,
+            mode = "markers",
+            text = ~label,
+            marker = list(size = 10),
+            showlegend = F) %>% 
+            layout(xaxis = list(title = paste("PC1:", round(pca.val[[1]], 2)*100, "%", sep = " ")),
+                   yaxis = list(title = paste("PC2:", round(pca.val[[2]], 2)*100, "%", sep = " ")))
+
+p.1
+
+```  
+
+```{r pca-2}
+p.2 <- plot_ly(data = pca.df) %>%
+  add_trace(type = "scatter",
+            x = ~PC1, y = ~PC3,
+            color = ~delivery, colors = pca.cols,
+            symbols = c("1" = "circle", "2" = "cross", "3" = "x", "4" = "square", "6" = "diamond"),
+            text = ~label,
+            mode = "markers") %>% 
+  add_trace(type = "scatter",
+            x = ~PC1, y = ~PC3,
+            symbol = ~day,
+            mode = "markers",
+            text = ~label,
+            marker = list(color = "grey", size = 8)) %>% 
+  add_trace(type = "scatter",
+            x = ~PC1, y = ~PC3,
+            color = ~delivery,
+            symbol = ~day,
+            mode = "markers",
+            text = ~label,
+            marker = list(size = 10),
+            showlegend = F) %>% 
+            layout(xaxis = list(title = paste("PC1:", round(pca.val[[1]], 2)*100, "%", sep = " ")),
+                   yaxis = list(title = paste("PC3:", round(pca.val[[3]], 2)*100, "%", sep = " ")))
+
+# p.2
+```
+
+```{r pca-3}
+p.3 <- plot_ly(data = pca.df) %>%
+  add_trace(type = "scatter",
+            x = ~PC2, y = ~PC3,
+            color = ~delivery, colors = pca.cols,
+            symbols = c("1" = "circle", "2" = "cross", "3" = "x", "4" = "square", "6" = "diamond"),
+            text = ~label,
+            mode = "markers") %>% 
+  add_trace(type = "scatter",
+            x = ~PC2, y = ~PC3,
+            symbol = ~day,
+            mode = "markers",
+            text = ~label,
+            marker = list(color = "grey", size = 8)) %>% 
+  add_trace(type = "scatter",
+            x = ~PC2, y = ~PC3,
+            color = ~delivery,
+            symbol = ~day,
+            mode = "markers",
+            text = ~label,
+            marker = list(size = 10),
+            showlegend = F) %>% 
+            layout(xaxis = list(title = paste("PC2:", round(pca.val[[2]], 2)*100, "%", sep = " ")),
+                   yaxis = list(title = paste("PC3:", round(pca.val[[3]], 2)*100, "%", sep = " ")))
+
+# p.3
+
+```
+
+#Differential Gene Expression
+
+##DGE overview
+
+The PCA's may be indicating that, with the exception of day 1 of mosquito transmission, the groups are fairly homogeneous up to day 3. There are small clusters that form, however there seems to be one replicate in each group that bucks the trend in most cases. Doing direct group comparisons means that it's likely to mask siginficant genes each tranmission group uses to fight the infection. If we identify what genes are differentially expressed within each transmission route throughout the time course, and then compare these gene lists, we can see what genes are shared/different between the transmission routes. This will hide some information, such as if a gene/geneset are shared between two transmission routes, but activated at different times, but this approach will narrow down our search in the first instance. 
+
+First of all we need to identify the DGE's in each transmission route, by comparing them to the controls.
+
+```{r dge-res, include = F}
+res.list <- list();
+design(dds) <- ~ grp;
+dds <- DESeq(dds);
+resultsNames(dds);  
+res.list[["mt.1_vs_naive"]]      <- results(dds, contrast=c("grp","mt.1","naive"));
+res.list[["mt.2_vs_naive"]]      <- results(dds, contrast=c("grp","mt.2","naive"));
+res.list[["mt.3_vs_naive"]]      <- results(dds, contrast=c("grp","mt.3","naive"));
+res.list[["mt.4_vs_naive"]]      <- results(dds, contrast=c("grp","mt.4","naive"));
+res.list[["mt.6_vs_naive"]]      <- results(dds, contrast=c("grp","mt.6","naive"));
+
+res.list[["rtmt.1_vs_naive"]]      <- results(dds, contrast=c("grp","rtmt.1","naive"));
+res.list[["rtmt.2_vs_naive"]]      <- results(dds, contrast=c("grp","rtmt.2","naive"));
+res.list[["rtmt.3_vs_naive"]]      <- results(dds, contrast=c("grp","rtmt.3","naive"));
+res.list[["rtmt.4_vs_naive"]]      <- results(dds, contrast=c("grp","rtmt.4","naive"));
+res.list[["rtmt.6_vs_naive"]]      <- results(dds, contrast=c("grp","rtmt.6","naive"));
+
+res.list[["sbp.1_vs_naive"]]      <- results(dds, contrast=c("grp","sbp.1","naive"));
+res.list[["sbp.2_vs_naive"]]      <- results(dds, contrast=c("grp","sbp.2","naive"));
+res.list[["sbp.3_vs_naive"]]      <- results(dds, contrast=c("grp","sbp.3","naive"));
+res.list[["sbp.4_vs_naive"]]      <- results(dds, contrast=c("grp","sbp.4","naive"));
+res.list[["sbp.6_vs_naive"]]      <- results(dds, contrast=c("grp","sbp.6","naive"));
+
+res.list[['mt.1_vs_sbp.1']]      <- results(dds, contrast=c("grp","mt.1","sbp.1"));
+res.list[['mt.2_vs_sbp.2']]      <- results(dds, contrast=c("grp","mt.2","sbp.2"));
+res.list[['mt.3_vs_sbp.3']]      <- results(dds, contrast=c("grp","mt.3","sbp.3"));
+res.list[['mt.4_vs_sbp.4']]      <- results(dds, contrast=c("grp","mt.4","sbp.4"));
+res.list[['mt.6_vs_sbp.6']]      <- results(dds, contrast=c("grp","mt.6","sbp.6"));
+
+res.list[['mt.1_vs_rtmt.1']]      <- results(dds, contrast=c("grp","mt.1","rtmt.1"));
+res.list[['mt.2_vs_rtmt.2']]      <- results(dds, contrast=c("grp","mt.2","rtmt.2"));
+res.list[['mt.3_vs_rtmt.3']]      <- results(dds, contrast=c("grp","mt.3","rtmt.3"));
+res.list[['mt.4_vs_rtmt.4']]      <- results(dds, contrast=c("grp","mt.4","rtmt.4"));
+res.list[['mt.6_vs_rtmt.6']]      <- results(dds, contrast=c("grp","mt.6","rtmt.6"));
+
+res.list[['rtmt.1_vs_sbp.1']]      <- results(dds, contrast=c("grp","rtmt.1","sbp.1"));
+res.list[['rtmt.2_vs_sbp.2']]      <- results(dds, contrast=c("grp","rtmt.2","sbp.2"));
+res.list[['rtmt.3_vs_sbp.3']]      <- results(dds, contrast=c("grp","rtmt.3","sbp.3"));
+res.list[['rtmt.4_vs_sbp.4']]      <- results(dds, contrast=c("grp","rtmt.4","sbp.4"));
+res.list[['rtmt.6_vs_sbp.6']]      <- results(dds, contrast=c("grp","rtmt.6","sbp.6"));
+
+
+## Filter results
+res.list <- lapply(res.list,function(res){
+  res <- as.data.frame(res);
+  colnames(res)[colnames(res) %in% "log2FoldChange"] <- "log2FC";
+  colnames(res)[colnames(res) %in% "padj"] <- "FDR";
+  res$DEG <- res$FDR <= 0.05 &
+    abs(res$log2FC)>= 1 & #only filters out logFC ±1
+    res$baseMean>=30         &
+    !is.na(res$log2FC)       &
+    !is.na(res$FDR);
+  res;
+})
+deg.meta <- as.data.frame(cbind(sapply(res.list[1:15],function(x){sum(x$DEG)})))
+names(deg.meta) <- "No. DEG"
+
+deg.meta
+```
+
+With the comparisons made and genes filtered to identify the DGE's we can see how many genes were identified within in each group.
+
+```{r deg-table}
+paged_table(deg.meta, options = list(rows.print = 15))
+```
+
+We can then find out the total number of genes used by each transmission group throughout the timecourse.
+```{r deg-total}
+# Mosquito vs Naive results and DEG
+mvn.res <- res.list[grep('^mt.._vs_naive', names(res.list))]
+mvn.deg <- lapply(mvn.res, function(df){return(df[df$DEG,])})
+
+# Recently MT vs Naive results and DEG
+rtvn.res <- res.list[grep('^rtmt.._vs_naive', names(res.list))]
+rtvn.deg <- lapply(rtvn.res, function(df){return(df[df$DEG,])})
+
+# SBP vs Naive results and DEG 
+svn.res <- res.list[grep('^sbp.._vs_naive', names(res.list))]
+svn.deg <- lapply(svn.res, function(df){return(df[df$DEG,])})
+
+# Genes involved in each transmission route
+mt.genes <- unique(unlist(sapply(mvn.deg, row.names)))
+rtmt.genes <- unique(unlist(sapply(rtvn.deg, row.names))) 
+sbp.genes <- unique(unlist(sapply(svn.deg, row.names))) 
+total.genes <- unique(do.call(c, list(mt.genes, rtmt.genes, sbp.genes)))
+
+# Common genes involved in each transmission response
+common.genes <- Reduce(intersect, list(mt.genes, rtmt.genes, sbp.genes))
+
+
+print(paste("MT:", length(mt.genes), "differntially expressed genes identified"))
+print(paste("RTMT:", length(rtmt.genes), "differentially expressed genes identified"))
+print(paste("SBP:", length(sbp.genes), "differentially expressed genes identified"))
+print(paste("Total number of differentially expressed genes identified across all groups: ", length(total.genes), "genes"))
+
+```
+
+
+##MT Day 1 -3
+### Gene List
+
+The general DGE analysis reveals that the MT group is transcriptionally different from Naive from Day 1-3, where other groups only show transcriptional differences from Day 4 onwards. The question remains is to what is happening in this transmission group that make
+```{r}
+mvn.early <- mvn.deg[1:3]
+mvn.early.list <- unique(unlist(sapply(mvn.early, row.names)))
+
+## Comment out during markdown rendering
+# write.table(x = mvn.early.list, file = paste(results.dir, "mvn_early_deg.txt", sep=""),
+#             sep = "\t",
+#             row.names = F,
+#             quote = F)
+
+
+# Panther DF
+panther.df <- read.table(file = paste(results.dir, "mvn_pantherGeneList.txt", sep=""),
+                         sep = "\t",
+                         quote = "",
+                         header = F,
+                         col.names = c("panther_id", "gene_id", "gene_name", "panther_family", "panther_protein", "species")) %>% 
+  separate_rows(gene_id, sep = ",", convert = TRUE) %>% 
+  separate_rows(panther_protein, sep = ";")
+  
+panther.mvn <- panther.df[panther.df$gene_id %in% mvn.early.list, ]
+
+```
+
+
+
+
+```{r innate-db}
+innate.db <- read.table(file = paste(results.dir, "mvn_InnateDB_genes.txt", sep=""),
+                         sep = "\t",
+                         quote = "",
+                         header = T)
+
+unique(innate.db$Pathway.Name)
+innate.path.df <- as.data.frame(table(innate.db$Pathway.Name), col.names = c("Pathway", "Freq")) 
+innate.path.df[order(innate.path.df$Freq, decreasing = T), ]
+
+mvn.innate <- unique(innate.db$Query.Xref)
+mvn.innate.ensembl <- gtf.dat$gene_id[gtf.dat$gene_name %in% mvn.innate]
+tpm.db["ENSMUSG00000021264", ]
+```
+ 
+```{r innate-heatmap}
+heat.dat   <- as.matrix(assay(vsd)[mvn.innate.ensembl, ]);
+heat.dat   <- t(apply(heat.dat,1,function(x){((x-mean(x,na.rm=TRUE))/sd(x,na.rm=TRUE))}));
+rownames(heat.dat) <- gtf.dat[mvn.innate.ensembl, "gene_name"];
+
+heat.dat <- heat.dat[ , grep("^mt|naive", colnames(heat.dat))]
+
+#order so days are together 
+heat.list <- colnames(heat.dat);
+heat.list <- as.data.frame(heat.list);
+heat.list$day <- ifelse(grepl("naive", heat.list$heat.list),
+                        0,
+                        str_match(string=heat.list$heat.list, pattern= "\\.d(.+)\\.")[,2]);
+heat.list$delivery <- ifelse(grepl("naive", heat.list$heat.list),
+                             "naive",
+                             str_match(string=heat.list$heat.list, pattern="^(.*)\\..*\\.")[,2]);
+heat.list$delivery <- ordered(factor(heat.list$delivery, levels= c('naive', 'sbp', 'rtmt', 'mt')))
+heat.list$rep <- as.integer(str_match(string=heat.list$heat.list, pattern=".*r(.)$")[,2]);
+heat.list <- heat.list[order(as.numeric(heat.list$day), as.numeric(as.factor(heat.list$delivery)), heat.list$rep),];
+heat.list
+heat.list <- as.vector(heat.list$heat.list);
+
+
+heat.dat <- heat.dat[,heat.list] # Use the same col order as the for the zscore heatmap
+
+
+ht <- Heatmap(heat.dat,
+              name = "z-score",
+              show_row_names          = TRUE,
+              show_column_names       = TRUE,
+              column_names_side       = "bottom",
+              show_column_dend        = FALSE,
+              cluster_columns         = FALSE,
+              rect_gp                 = gpar(col = "white", lwd = 1),
+              row_dend_width          = unit(30, "mm"),
+              column_dend_height      = unit(30, "mm"),
+              show_heatmap_legend     = TRUE,
+              clustering_distance_rows = 'pearson',
+              column_names_max_height = unit(8, "cm"),
+              row_names_gp            = gpar(fontsize = 6),
+              column_names_gp         = gpar(fontsize = 10),
+              # split                   = split.vec, #This would use vector I created above to split and cluster the genes
+              # top_annotation          = ha1,
+              # bottom_annotation       = anno_bottom,
+              col                     = colorRamp2(c(min(heat.dat)-0.5, 0, max(heat.dat)+0.5), rev(colorRampPalette(brewer.pal(9, "RdBu"))(3))));
+
+
+pdf(paste(results.dir,"mvn_innate_hm.pdf",sep=''),width=15,height=30);
+ht
+decorate_heatmap_body('z-score', c(for(d in seq(0, length(heat.list), 4)){
+  grid.lines(x=c(d/24, d/24), y=c(0,1), gp= gpar(col = 'black', lty="solid", lwd=2))},
+  grid.lines(y=c(0,0), x=c(0,1), gp= gpar(col = 'black', lty='solid', lwd=2)),
+  grid.lines(y=c(1,1), x=c(0,1), gp= gpar(col = 'black', lty='solid', lwd=2))), slice = 1)
+dev.off();
+```
+
+```{r}
+mvn.1.3 <- lapply(mvn.early, row.names)
+
+mvn.1.3.innate <- lapply(mvn.1.3, function(x){
+  x <- intersect(x, mvn.innate.ensembl) 
+  x
+})
+
+mvn.1.3.innate[[1]]
+```
+
+```{r}
+heat.dat   <- as.matrix(tpm.db[mvn.1.3.innate[[1]], ]);
+heat.dat   <- log2(heat.dat + 1)
+# heat.dat   <- t(apply(heat.dat,1,function(x){((x-mean(x,na.rm=TRUE))/sd(x,na.rm=TRUE))}));
+rownames(heat.dat) <- gtf.dat[mvn.1.3.innate[[1]], "gene_name"];
+
+heat.dat <- heat.dat[ , grep("^mt|naive", colnames(heat.dat))]
+
+#order so days are together 
+heat.list <- colnames(heat.dat);
+heat.list <- as.data.frame(heat.list);
+heat.list$day <- ifelse(grepl("naive", heat.list$heat.list),
+                        0,
+                        str_match(string=heat.list$heat.list, pattern= "\\.d(.+)\\.")[,2]);
+heat.list$delivery <- ifelse(grepl("naive", heat.list$heat.list),
+                             "naive",
+                             str_match(string=heat.list$heat.list, pattern="^(.*)\\..*\\.")[,2]);
+heat.list$delivery <- ordered(factor(heat.list$delivery, levels= c('naive', 'sbp', 'rtmt', 'mt')))
+heat.list$rep <- as.integer(str_match(string=heat.list$heat.list, pattern=".*r(.)$")[,2]);
+heat.list <- heat.list[order(as.numeric(heat.list$day), as.numeric(as.factor(heat.list$delivery)), heat.list$rep),];
+heat.list
+heat.list <- as.vector(heat.list$heat.list);
+
+
+heat.dat <- heat.dat[,heat.list] # Use the same col order as the for the zscore heatmap
+
+
+ht <- Heatmap(heat.dat,
+              name = "log(tpm+1)",
+              show_row_names          = TRUE,
+              show_column_names       = TRUE,
+              column_names_side       = "bottom",
+              show_column_dend        = FALSE,
+              cluster_columns         = FALSE,
+              rect_gp                 = gpar(col = "white", lwd = 1),
+              row_dend_width          = unit(30, "mm"),
+              column_dend_height      = unit(30, "mm"),
+              show_heatmap_legend     = TRUE,
+              clustering_distance_rows = 'pearson',
+              column_names_max_height = unit(8, "cm"),
+              row_names_gp            = gpar(fontsize = 6),
+              column_names_gp         = gpar(fontsize = 10),
+              # split                   = split.vec, #This would use vector I created above to split and cluster the genes
+              # top_annotation          = ha1,
+              # bottom_annotation       = anno_bottom,
+              col                     = viridis::viridis(100));
+
+
+pdf(paste(results.dir,"mvn_innate_d1_tpm.pdf",sep=''),width=15,height=30);
+ht
+decorate_heatmap_body('log(tpm+1)', c(for(d in seq(0, length(heat.list), 4)){
+  grid.lines(x=c(d/24, d/24), y=c(0,1), gp= gpar(col = 'black', lty="solid", lwd=2))},
+  grid.lines(y=c(0,0), x=c(0,1), gp= gpar(col = 'black', lty='solid', lwd=2)),
+  grid.lines(y=c(1,1), x=c(0,1), gp= gpar(col = 'black', lty='solid', lwd=2))), slice = 1)
+dev.off();
+
+```
+```{r}
+ensembl <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+attributes <- listAttributes(ensembl)
+attributes
+#ensembl
+# mvn.early.biomart <-  getBM(attributes = c("ensembl_gene_id","family", "family_description", "pfam", "interpro", "interpro_short_description"),
+mvn.early.fam <-  getBM(attributes = c("ensembl_gene_id","family", "family_description"),
+      filters = "ensembl_gene_id",
+      values = mvn.early.list,
+      mart = ensembl) %>% filter(family != "")
+
+mvn.fam.df <- as.data.frame(table(mvn.early.fam$family))
+mvn.fam.df <- mvn.fam.df[order(mvn.fam.df$Freq, decreasing = T), ]
+mvn.fam.df$description <- sapply(mvn.fam.df$Var1, function(x){
+  df <- unique(mvn.early.fam[mvn.early.fam$family %in% x, "family_description"])
+  df
+})
+mvn.fam.df$Var1 <- factor(mvn.fam.df$Var1, levels = mvn.fam.df$Var1)
+View(mvn.fam.df)
+
+#pfam
+mvn.early.pfam <-  getBM(attributes = c("ensembl_gene_id","pfam"),
+      filters = "ensembl_gene_id",
+      values = mvn.early.list,
+      mart = ensembl) %>% filter(pfam != "")
+mvn.pfam.df <- as.data.frame(table(mvn.early.pfam$pfam))
+mvn.pfam.df <- mvn.pfam.df[order(mvn.pfam.df$Freq, decreasing = T), ]
+
+
+#interpro
+mvn.early.interpro <-  getBM(attributes = c("ensembl_gene_id","interpro", "interpro_description"),
+      filters = "ensembl_gene_id",
+      values = mvn.early.list,
+      mart = ensembl) %>% filter(interpro != "")
+
+mvn.interpro.df <- as.data.frame(table(mvn.early.interpro$interpro))
+mvn.interpro.df <- mvn.interpro.df[order(mvn.interpro.df$Freq, decreasing = T), ]
+mvn.interpro.df$desc <- sapply(mvn.interpro.df$Var1, function(x){
+  df <- unique(mvn.early.interpro[mvn.early.interpro$interpro %in% x, "interpro_description"])
+  df
+})
+mvn.interpro.df$Var1 <- factor(mvn.interpro.df$Var1,levels = mvn.interpro.df$Var1)
+View(mvn.early.interpro)
+View(mvn.interpro.df)
+View(mvn.pfam.df)
+View(mvn.fam.df)
+mvn.early.interpro$interpro <- factor(mvn.early.interpro$interpro, levels = mvn.interpro.df$Var1)
+mvn.early.fam$family <- factor(mvn.early.fam$family, levels = mvn.fam.df$Var1)
+
+```
+ 
+
+```{r}
+tf.db <- read.table("/Users/alderc/1-projects/9-Data/tf_db_riken.txt",
+                    sep = "\t",
+                    header = T,
+                    quote = "")
+
+rownames(tf.db) <- tf.db$Symbol
+
+str_to_upper(mvn.innate)
+mvn.tf <- tf.db[mvn.innate, ] %>% drop_na()
+
+
+tf.trrust.db <- read.table("/Users/alderc/1-projects/9-Data/trrust_rawdata.mouse.tsv",
+                           sep = "\t",
+                           header = T,
+                           quote = "")
+mvn.trrust.df <- tf.trrust.db[tf.trrust.db$TF %in% mvn.innate, ]
+
+View(mvn.trrust.tf)
+
+mvn.trrust.tf <- unique(mvn.trrust.tf$TF)
+
+mvn.early.names <- gtf.dat[mvn.early.list, "gene_name"]
+mvn.early.tf.targets <- mvn.trrust.df[mvn.trrust.df$Target %in% mvn.early.names, ]
+unique(mvn.early.tf.targets$Target)
+
+```
+
+```{r}
+mvn.df <- data.frame(gene_id = mvn.early.list,
+                     gene_symbol = mvn.early.names,
+                     row.names = 1)
+
+mvn.df$Day_1 <- ifelse(rownames(mvn.df) %in% rownames(mvn.early[[1]]), "Yes", "No")
+mvn.df$Day_2 <- ifelse(rownames(mvn.df) %in% rownames(mvn.early[[2]]), "Yes", "No")
+mvn.df$Day_3 <- ifelse(rownames(mvn.df) %in% rownames(mvn.early[[3]]), "Yes", "No")
+mvn.df$innate <- ifelse(rownames(mvn.df) %in% mvn.innate.ensembl, "Yes", "No")
+mvn.df$tf <- ifelse(mvn.df$gene_symbol %in% mvn.trrust.tf, "Yes", "No")
+mvn.df$inter <- sapply(rownames(mvn.df), function(x){
+  df <- mvn.early.interpro[mvn.early.interpro$ensembl_gene_id %in% x, ]
+  df <- df[order(df$interpro), "interpro_description"]
+  df[1]
+})
+mvn.df$ensembl_fam <- sapply(rownames(mvn.df), function(x){
+  df <- mvn.early.fam[mvn.early.fam$ensembl_gene_id %in% x, ]
+  df <- df[order(df$family), "family_description"]
+  df[1]
+})
+mvn.df$rtmt <- sapply(rownames(mvn.df), function(g){
+for (i in c(1,2,3,4,6)){
+  tmp <- NULL
+  x <- paste("rtmt.", i, "_vs_naive", sep = "")
+  df <- rvn.deg[[x]]
+  df <- df[g, ] %>% drop_na()
+  if(dim(df)[1] == 1){
+    tmp <- i
+    break
+  }
+}
+  if(is.null(tmp)){
+    tmp <- NA
+  }
+  return(tmp)
+})
+mvn.df$sbp <- sapply(rownames(mvn.df), function(g){
+for (i in c(1,2,3,4,6)){
+  tmp <- NULL
+  x <- paste("sbp.", i, "_vs_naive", sep = "")
+  df <- svn.deg[[x]]
+  df <- df[g, ] %>% drop_na()
+  if(dim(df)[1] == 1){
+    tmp <- i
+    break
+  }
+}
+  if(is.null(tmp)){
+    tmp <- NA
+  }
+  return(tmp)
+})
+
+View(mvn.df)
+
+rvn.deg <- deg.list[6:10]
+svn.deg <- deg.list[11:15]
+m.genes <- rownames(mvn.df)
+m.genes[1]
+sapply(c(m.genes[1:5], "ENSMUSG00000064844"), function(g){
+for (i in c(1,2,3,4,6)){
+  tmp <- NULL
+  x <- paste("rtmt.", i, "_vs_naive", sep = "")
+  df <- rvn.deg[[x]]
+  df <- df[g, ] %>% drop_na()
+  if(dim(df)[1] == 1){
+    tmp <- i
+    break
+  }
+}
+  if(is.null(tmp)){
+    tmp <- NA
+  }
+  return(tmp)
+})
+
+```
+
+

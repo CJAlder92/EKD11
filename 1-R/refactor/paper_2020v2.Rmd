@@ -1,0 +1,487 @@
+---
+title: "EKD11_Paper"
+author: "Chris Alder"
+date: "17/02/2020"
+output: 
+  html_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This is an analysis of the EKD11 transcriptomics data. The document outlines a basic structure of the analysis and the order in which it could be presented in the paper.
+
+
+## Setting workspace
+
+First we must clear the work space and load the packages used for the analysis. We will also set the directories for the work.
+
+
+```{r,  message = FALSE}
+rm(list = ls())
+source('/Users/alderc/1-projects/1-PIR_project/3-EKD11_AS_Early_TP/1-R/refactor/packages.R')
+
+nf.dir      <- "/Users/alderc/1-projects/CAMP/1-AS_timecourse/2-EKD11/1-Pipeline/1-Nextflow/"
+work.dir    <- "/Users/alderc/1-projects/1-PIR_project/3-EKD11_AS_Early_TP/"
+r.dir       <- paste(work.dir, "1-R/",sep='') #change once refactor is completed
+tmp.dir     <- paste(work.dir,"tmp/",sep='')
+data.dir    <- paste(work.dir,"4-data/",sep='')
+results.dir <- paste(work.dir,"2-results_2020/",sep='')
+genome.dir  <- "/Users/alderc/1-projects/9-Data/1-Reference_genomes/1-Mus_musculus/"
+
+# Checks for directories before creating (to prevent overwriting)
+for (dir in grep("\\.dir$",ls(),value=T)) {
+  if (!file.exists(get(dir))) { dir.create(get(dir),recursive=TRUE, mode="0755"); }
+}
+
+## Files
+gtf.file <- paste(genome.dir, "Mus_musculus.GRCm38.86.gtf", sep="")
+design.file <- paste(nf.dir,"design.csv",sep='')
+design.baseline <- "naive" # This is the treatment group you want to use for baseline measurements and test others against - Usually control
+
+## Output names
+count.output <- "genes.normalised_counts_with_controls.xls.gz" 
+log.output   <-  "genes.vst_counts_with_controls.xls.gz"
+matrix.output <- "EKD11_counts.csv"
+
+```
+
+## DESeq
+
+This section will run DESeq. It will create the statistical model to calculate the co-efficient's for each sample. We will be using the grp factor in the design file to calculate the co-efficient's, due to the confounding nature of the Delivery:Day factors which DESeq won't allow. This doesn't affect any of the downstream analysis when tested. The code chunk will also set "Naive" to be the baseline model, as well as create the matrices for count data (both normalised and raw) as well as one for the log-transformed normalised values. 
+
+```{r DESeq}
+## Loading GTF file
+gtf.dat    <- import(gtf.file)
+gtf.dat    <- as.data.frame(gtf.dat[gtf.dat$type %in% "gene",])
+gtf.dat$GRCm38 <- paste("chr",gtf.dat$seqnames,":",gtf.dat$start,"-",gtf.dat$end,sep='')
+rownames(gtf.dat) <- gtf.dat$gene_id
+
+## Design file
+design.file      <- paste(nf.dir, "design_2020.csv", sep='') # For 2020 analysis
+# design.file <- paste(nf.dir, "design.csv", sep = "")
+design           <- read.delim(design.file, header=TRUE, sep=",", stringsAsFactors = TRUE)
+rownames(design) <- design$label
+design$delivery  <- relevel(design$delivery, design.baseline) # sets design.baseline as first factor (baseline)
+design$grp       <- relevel(design$grp, design.baseline) # same as above but for analysis with controls 
+design$day       <- factor(as.character(design$day), levels=as.character(sort(unique(design$day)))) # factors days in numberical order
+design$replicate <- as.factor(design$replicate) # factors replicates (order not important)
+
+## Importing counts
+txi <- tximport(paste(nf.dir, "results/rsem/", design$lims.name, ".genes.results", sep=""), type="rsem")
+txi$length[txi$length==0] <- 1
+
+## DESeq2
+if (file.exists(paste(r.dir, "Projects/deseq.Rdata", sep = ""))){
+  load(paste(r.dir, "Projects/deseq.Rdata", sep = ""))
+}else{
+dat <- DESeqDataSetFromTximport(txi, design, ~ grp) # For baseline counts - full rank in other file
+rowData(dat) <- gtf.dat[rownames(dat),c("gene_id","gene_name","gene_source","gene_biotype","GRCm38")]
+dds <- DESeq(dat)
+vsd <- vst(dat, blind = TRUE)
+save(dds, vsd, file = paste(r.dir, "Projects/deseq.Rdata", sep = ""))}
+# save(object = vsd,  file = paste(r.dir, "Projects/deseq.Rdata", sep = ""))}
+
+
+
+## Outputs
+# Counts Dataframe (Normalised)
+count.norm  <- counts(dds,normalized=TRUE)
+count.dBase <- data.frame(count.norm,rowData(dds),stringsAsFactors=FALSE)
+rownames(count.dBase) <- count.dBase$gene_id
+if(!file.exists(paste(results.dir,count.output ,sep=''))){
+write.table(count.dBase,file=gzfile(paste(results.dir,count.output ,sep='')),col.names=TRUE,row.names=FALSE,sep="\t",quote=F)}
+
+# Log counts (vst)
+vst.dBase <- assay(vsd)
+vst.dBase <- data.frame(vst.dBase,rowData(dds),stringsAsFactors=FALSE)
+# write.table(vst.dBase,file=gzfile(paste(results.dir,log.output,sep='')),col.names=TRUE,row.names=FALSE,sep="\t",quote=F)
+
+# Count Matrix (un-normalised)
+count.mat <- counts(dds, normalized=FALSE)
+# write.table(count.mat, file=gzfile(paste(results.dir, matrix.output, sep='')), col.names=TRUE, row.names=TRUE, sep=',',quote=FALSE)
+
+### Put into separate R file at some point
+ensembl.decode <- data.frame(gene_id = rownames(gtf.dat),
+                             gene_name = gtf.dat$gene_name)
+
+# write.table(ensembl.decode, file = paste(results.dir, "ensembl_decode.csv", sep=""), col.names = TRUE, row.names = TRUE, sep=",", quote=FALSE)
+```
+
+
+## Sample divergence  
+
+The first stage in the analysis, will be to assess the separation of the samples on a global scale. We will do this using PCA and hierarchical clustering in the first instance. 
+
+### PCA
+
+For the PCA, we will be using the log transformed matrix (vsd), and using the top 1000 variable genes in the data set, to create the Principal components and loading's
+
+```{r PCA}
+rv <- rowVars(assay(vsd)) 
+select <- order(rv, decreasing = TRUE)[1:1000]
+
+pca <- prcomp(t(assay(vsd)[select, ]))
+pca.sum <- summary(pca)
+pca.val <- pca.sum$importance[2,1:3]
+pca.df <- as.data.frame(pca$x[,1:3])
+pca.df <- cbind(pca.df, design[rownames(pca.df), c("delivery", "day", "grp", "label")])
+pca.cols <- c("mosquito" = "grey50", "blood" = "deeppink2", "naive" = "black", 'recent_blood' = "dodgerblue2")
+
+p.1 <- plot_ly(data = pca.df) %>%
+  add_trace(type = "scatter",
+            x = ~PC1, y = ~PC2,
+            color = ~delivery, colors = pca.cols,
+            symbols = c("0" = "triangle-up" ,"1" = "circle", "2" = "cross", "3" = "x", "4" = "square", "6" = "diamond"),
+            text = ~label,
+            mode = "markers") %>% 
+  add_trace(type = "scatter",
+            x = ~PC1, y = ~PC2,
+            symbol = ~day,
+            mode = "markers",
+            text = ~label,
+            marker = list(color = "grey", size = 8)) %>% 
+  add_trace(type = "scatter",
+            x = ~PC1, y = ~PC2,
+            color = ~delivery,
+            symbol = ~day,
+            mode = "markers",
+            text = ~label,
+            marker = list(size = 10),
+            showlegend = F) %>% 
+            layout(xaxis = list(title = paste("PC1:", round(pca.val[[1]], 2)*100, "%", sep = " ")),
+                   yaxis = list(title = paste("PC2:", round(pca.val[[2]], 2)*100, "%", sep = " ")))
+## Exporting File
+Sys.setenv("PATH" = paste(Sys.getenv("PATH"), "/anaconda3/bin", sep = .Platform$path.sep)) ## To run orca
+orca(p.1, file="../../2-results_2020/PC1_PC2.pdf", format = "pdf")# Orca will append to WD (no absolute path)
+
+p.1
+
+```
+
+The PCA shows little divergence from the control samples for both SBP and RTMT between day 1 and 3, with samples within these two conditions starting to differentiate on day 4. MT has a more distinct cluster from day 1 post-blood infection, with subsequent days showing less definitive clustering. By day 6 all 3 conditions cluster closely together along with day 4 MT. It should be noted that within group variance (delivery:day combinations) looks to be quite high according to the PCA, with at least one sample from each combination clustering away from the others. 
+
+### Dendrogram
+A dendogram will give us a better idea of how the samples cluster together. Again, we will use the top 1000 variable genes in the data set to calculate the values.
+
+#### Correlation 
+```{r Dendogram_C, fig.height = 10, fig.width = 10}
+# Changing the labels for figure purposes
+c.assay <- assay(vsd)
+labels <- vsd$label.short #change to vsd tomorrow
+labels <- toupper(substring(labels, 3))
+colnames(c.assay) <- labels
+
+# Dissimilarity matrix (pearsons)
+c <- cor(c.assay[select, ], method = 'pearson')
+c.dist <- as.dist(1-c)
+# dist.mat <- dist(t(assay(vsd)), method = "euclidean")
+hr.cor <- hclust(c.dist, method = "ward.D2", members=NULL)
+
+# Dendrogram
+dend.cor <- (as.dendrogram(hr.cor))
+delivery <- vsd$delivery
+cols <- c("black", "deeppink2", "grey50", "dodgerblue") #order in levels of delivery
+col_grp <- cols[delivery]
+col_grp <- col_grp[order.dendrogram(dend.cor)]
+# pdf(paste(results.dir, "dendrogram_colour.pdf", sep = ""), width = 10, height = 10)
+par(mar = c(3,1,1,7))
+dend.cor  %>% 
+  set("labels_colors", col_grp) %>% #change label colors to GROUP
+  plot(main = "Dendrogram of sample correlation", horiz = TRUE)
+legend("topleft", legend = levels(delivery), fill = cols, cex = 0.75)
+# dev.off()
+
+```
+For this dendrogram, we have used the pearsons correlation method to create the dissimilarity matrix, and then subsequently clustered using Ward's D2 method.
+With this clustering method and cutting the dendogram at it highest branch (K = 2), we can see that K~1~ contains all of the day 6 samples for each transmission as well as many day 4 samples and finally the day 3 samples for MT only. Cutting the K~1~ cluster at its highest branch separates the day 6 samples into its own cluster. Looking at K~2~, which contains all the samples not mentioned above, there doesn't seem to be many clear sub-clusters within the structure. These results coincide with what the PCA plot showed us. 
+
+#### Distance
+```{r Dendrogram_D, fig.height = 10, fig.width = 10}
+# Dissimilarity matrix (pearsons)
+dist.mat <- dist(t(c.assay[select, ]), method = "euclidean")
+hr.dist <- hclust(dist.mat, method = "ward.D2", members=NULL)
+
+# Dendrogram
+dend.dist <- (as.dendrogram(hr.dist))
+delivery <- vsd$delivery
+cols <- c("black", "deeppink2", "grey50", "dodgerblue") #order in levels of delivery
+col_grp <- cols[delivery]
+col_grp <- col_grp[order.dendrogram(dend.dist)]
+# pdf(paste(results.dir, "dendrogram_colour.pdf", sep = ""), width = 10, height = 10)
+par(mar = c(3,1,1,7))
+dend.dist  %>% 
+  set("labels_colors", col_grp) %>% #change label colors to GROUP
+  plot(main = "Dendrogram of sample euclidian distances", horiz = TRUE)
+legend("topleft", legend = levels(delivery), fill = cols, cex = 0.75)
+# dev.off()
+
+```
+
+By using the euclidian distance to create the dissimilarity matrix, we get broadly similar results with a slight alteration. In this instance, K~1~ still contains the same samples as before, but the sub-clusters don't separate out the day 6 samples as cleanly as before.
+
+## MT vs SBP
+
+The first important comparison to perform is a direct comparison of MT and SBP. We know that the natural route of transmission (MT) results in an attenuated infection compared to SBP and differneces have been identified within the parasite at the transcriptional level. Therefore, by looking at the host's splenic transcriptome we hope to be able to see how these transcriptionally distinct parasites affect the immune response.
+
+```{r MT_SBP}
+if(file.exists(paste(r.dir, "Projects/results.Rdata", sep = ""))){
+  load(paste(r.dir, "Projects/results.Rdata", sep = ""))
+}else{
+res.list <- list()
+
+res.list[["mt.1_vs_naive"]]      <- results(dds, contrast=c("grp","mt.1","naive"))
+res.list[["mt.2_vs_naive"]]      <- results(dds, contrast=c("grp","mt.2","naive"))
+res.list[["mt.3_vs_naive"]]      <- results(dds, contrast=c("grp","mt.3","naive"))
+res.list[["mt.4_vs_naive"]]      <- results(dds, contrast=c("grp","mt.4","naive"))
+res.list[["mt.6_vs_naive"]]      <- results(dds, contrast=c("grp","mt.6","naive"))
+
+res.list[["rtmt.1_vs_naive"]]      <- results(dds, contrast=c("grp","rtmt.1","naive"))
+res.list[["rtmt.2_vs_naive"]]      <- results(dds, contrast=c("grp","rtmt.2","naive"))
+res.list[["rtmt.3_vs_naive"]]      <- results(dds, contrast=c("grp","rtmt.3","naive"))
+res.list[["rtmt.4_vs_naive"]]      <- results(dds, contrast=c("grp","rtmt.4","naive"))
+res.list[["rtmt.6_vs_naive"]]      <- results(dds, contrast=c("grp","rtmt.6","naive"))
+
+res.list[["sbp.1_vs_naive"]]      <- results(dds, contrast=c("grp","sbp.1","naive"))
+res.list[["sbp.2_vs_naive"]]      <- results(dds, contrast=c("grp","sbp.2","naive"))
+res.list[["sbp.3_vs_naive"]]      <- results(dds, contrast=c("grp","sbp.3","naive"))
+res.list[["sbp.4_vs_naive"]]      <- results(dds, contrast=c("grp","sbp.4","naive"))
+res.list[["sbp.6_vs_naive"]]      <- results(dds, contrast=c("grp","sbp.6","naive"))
+
+res.list[['mt.1_vs_sbp.1']]      <- results(dds, contrast=c("grp","mt.1","sbp.1"));
+res.list[['mt.2_vs_sbp.2']]      <- results(dds, contrast=c("grp","mt.2","sbp.2"));
+res.list[['mt.3_vs_sbp.3']]      <- results(dds, contrast=c("grp","mt.3","sbp.3"));
+res.list[['mt.4_vs_sbp.4']]      <- results(dds, contrast=c("grp","mt.4","sbp.4"));
+res.list[['mt.6_vs_sbp.6']]      <- results(dds, contrast=c("grp","mt.6","sbp.6"));
+
+res.list[['mt.1_vs_rtmt.1']]      <- results(dds, contrast=c("grp","mt.1","rtmt.1"));
+res.list[['mt.2_vs_rtmt.2']]      <- results(dds, contrast=c("grp","mt.2","rtmt.2"));
+res.list[['mt.3_vs_rtmt.3']]      <- results(dds, contrast=c("grp","mt.3","rtmt.3"));
+res.list[['mt.4_vs_rtmt.4']]      <- results(dds, contrast=c("grp","mt.4","rtmt.4"));
+res.list[['mt.6_vs_rtmt.6']]      <- results(dds, contrast=c("grp","mt.6","rtmt.6"));
+
+res.list[['rtmt.1_vs_sbp.1']]      <- results(dds, contrast=c("grp","rtmt.1","sbp.1"));
+res.list[['rtmt.2_vs_sbp.2']]      <- results(dds, contrast=c("grp","rtmt.2","sbp.2"));
+res.list[['rtmt.3_vs_sbp.3']]      <- results(dds, contrast=c("grp","rtmt.3","sbp.3"));
+res.list[['rtmt.4_vs_sbp.4']]      <- results(dds, contrast=c("grp","rtmt.4","sbp.4"));
+res.list[['rtmt.6_vs_sbp.6']]      <- results(dds, contrast=c("grp","rtmt.6","sbp.6"));
+
+save(res.list, file = paste(r.dir, "Projects/results.Rdata", sep = "")) ##### SORT LATER 
+}
+
+res.list <- lapply(res.list,function(res){
+  res <- as.data.frame(res)
+  colnames(res)[colnames(res) %in% "log2FoldChange"] <- "log2FC"
+  colnames(res)[colnames(res) %in% "padj"] <- "FDR"
+  res$DEG <- res$FDR <= 0.05 &
+    abs(res$log2FC)>= 1 & #only filters out logFC ±1 N.B CHANGE FOR RMT vs SBP COMPARISONS
+    res$baseMean>=30         &
+    !is.na(res$log2FC)       &
+    !is.na(res$FDR)
+  res
+})
+
+save(res.list, file = paste(r.dir, "Projects/results.Rdata", sep = ""))
+cbind(sapply(res.list, function(x){sum(x$DEG)}))
+mt.sbp.table <- data.frame(DEG = cbind(sapply(res.list,function(x){sum(x$DEG)})),
+                           UPREG = sapply(res.list, function(x){
+                             sub <- subset(x, log2FC > 0 & DEG == TRUE)
+                             sum(sub$DEG)
+                           }),
+                           DOWNREG = sapply(res.list, function(x){
+                             sub <- subset(x, log2FC < 0 & DEG == TRUE)
+                             sum(sub$DEG)
+                           }))
+
+mt.sbp.table
+
+```
+
+As we used total RNA-seq, we should filter for protein coding genes to try and narrow our search.
+```{r}
+mt.sbp.deg <- lapply(res.list, function(x){
+  x <- x[x$DEG, ]
+})
+
+mt.sbp.deg.list <- unique(unlist(sapply(mt.sbp.deg, row.names)))
+mt.sbp.deg.pc.list <- intersect(mt.sbp.deg.list, gtf.dat$gene_id[gtf.dat$gene_biotype %in% "protein_coding"])
+
+
+mt.sbp.deg.pc <- lapply(mt.sbp.deg, function(df){
+  df <- df[rownames(df) %in% mt.sbp.deg.pc.list, ]
+})
+
+mt.sbp.pc.table <- data.frame(DEG = cbind(sapply(mt.sbp.deg.pc,function(x){dim(x)[1]})),
+                           UPREG = sapply(mt.sbp.deg.pc, function(x){
+                             sub <- subset(x, log2FC > 0)
+                             sum(sub$DEG)
+                           }),
+                           DOWNREG = sapply(mt.sbp.deg.pc, function(x){
+                             sub <- subset(x, log2FC < 0)
+                             sum(sub$DEG)
+                           }))
+
+
+mt.sbp.pc.table
+
+```
+
+
+
+
+
+During the direct pairwise comparisons, we have set slightly relaxed setting for the identification of differentially expressed genes (FDR < 0.01 and abs(FC) > 1.4). The reason for the relaxed parameters for fold change allows us to capture more nuanced immunological responses.
+
+The direct comparison results shows a clear difference in the two transmission types. There are a significant number of differentially expressed genes at each timepoint, even at day 6 where the PCA and dendrograms indicated a trend of similarity between the groups. When seperating the differentially expressed genes into whether they were upregulated or downregulated, we see that the majority of genes at each timepoint are upregulated in MT. There seems to be a big response in MT at day 1 that appears to be absent in SBP.
+
+### Day 1
+
+```{r MT_SBP_D1}
+
+mt.sbp.d1 <- res.list[[1]] %>% 
+  subset(DEG == T)
+mt.sbp.d1$gene_name <- gtf.dat[rownames(mt.sbp.d1), "gene_name"]
+
+mt.sbp.d1.up <- subset(mt.sbp.d1, log2FC > 0)
+mt.sbp.d1.down <- subset(mt.sbp.d1, log2FC < 0)
+
+```
+
+#### Heatmap
+To visualise the expression pattern of these genes, we will make a heatmap to which should identify clusters of similarly expressed genes. We will separate out the genes into upregulated and downregulated genes to break up the number of genes in each heatmap. 
+```{r Heatmap-up, fig.height = 30, fig.width = 15}
+heat.genes <- rownames(mt.sbp.d1.up)
+heat.dat <-as.matrix(assay(vsd)[heat.genes, ])
+samples.rmv <- grep("rtmt", colnames(heat.dat))
+heat.dat <- heat.dat[, -samples.rmv]
+heat.dat   <- t(apply(heat.dat,1,function(x){((x-mean(x,na.rm=TRUE))/sd(x,na.rm=TRUE))}))
+rownames(heat.dat) <- gtf.dat[heat.genes,"gene_name"]
+
+#order so days are together 
+heat.list <- colnames(heat.dat);
+heat.list <- as.data.frame(heat.list);
+heat.list$day <- ifelse(grepl("naive", heat.list$heat.list),
+                        0,
+                        str_match(string=heat.list$heat.list, pattern= "\\.d(.+)\\.")[,2])
+heat.list$delivery <- ifelse(grepl("naive", heat.list$heat.list),
+                             "naive",
+                             str_match(string=heat.list$heat.list, pattern="^(.*)\\..*\\.")[,2])
+heat.list$delivery <- ordered(factor(heat.list$delivery, levels= c('naive', 'sbp', 'rtmt', 'mt')))
+heat.list$rep <- as.integer(str_match(string=heat.list$heat.list, pattern=".*r(.)$")[,2])
+heat.list <- heat.list[order(as.numeric(heat.list$day), as.numeric(as.factor(heat.list$delivery)), heat.list$rep),]
+heat.list <- as.vector(heat.list$heat.list);
+heat.dat <- heat.dat[,heat.list] 
+
+ht <- Heatmap(heat.dat,
+              name = "zscore",
+              show_row_names          = TRUE,
+              show_column_names       = TRUE,
+              column_names_side       = "bottom",
+              show_column_dend        = FALSE,
+              cluster_columns         = FALSE,
+              rect_gp                 = gpar(col = "white", lwd = 1),
+              row_dend_width          = unit(30, "mm"),
+              column_dend_height      = unit(30, "mm"),
+              show_heatmap_legend     = TRUE,
+              clustering_distance_rows = 'euclidean',
+              column_names_max_height = unit(8, "cm"),
+              row_names_gp            = gpar(fontsize = 6),
+              column_names_gp         = gpar(fontsize = 10),
+              # split                   = split.vec, #This would use vector I created above to split and cluster the genes
+              # top_annotation          = ha1,
+              # bottom_annotation       = anno_bottom,
+              col                     = colorRamp2(c(-3.5, 0, 3.5), rev(colorRampPalette(brewer.pal(9, "RdBu"))(3))));
+
+ht
+```
+
+
+```{r, fig.height = 10, fig.width = 15}
+
+# Heatmap Function
+do_heatmap <- function(heat.mat, title = "Heatmap"){
+  n <- ncol(heat.mat)
+  draw(Heatmap(heat.mat,
+               name = "zscore",
+               column_title = title,
+               column_title_gp = gpar(fontsize = 20, fontface = "bold"),
+               show_row_names          = TRUE,
+               show_column_names       = TRUE,
+               column_names_side       = "bottom",
+               show_column_dend        = FALSE,
+               cluster_columns         = FALSE,
+               rect_gp                 = gpar(col = "white", lwd = 1),
+               row_dend_width          = unit(30, "mm"),
+               column_dend_height      = unit(30, "mm"),
+               show_heatmap_legend     = TRUE,
+               clustering_distance_rows = "euclidean",
+               column_names_max_height = unit(8, "cm"),
+               row_names_gp            = gpar(fontsize = 6),
+               column_names_gp         = gpar(fontsize = 10),
+               col                     = colorRamp2(c(min(heat.mat), 0, max(heat.mat)), rev(colorRampPalette(brewer.pal(9, "RdBu"))(3)))))
+  
+    decorate_heatmap_body("zscore", c(for(d in seq(0, n, 4)){
+    grid.lines(x = c(d/n, d/n), y = c(0,1), gp= gpar(col = "black", lty="solid", lwd=2))},
+    grid.lines(x = c(0,1), y = c(0,0), gp= gpar(col = "black", lty="solid", lwd=2)),
+    grid.lines(x = c(0,1), y = c(1,1), gp= gpar(col = "black", lty="solid", lwd=2))))
+}
+
+
+heat.dist <- dist(heat.dat, method = "euclidean")
+heat.hr <- hclust(heat.dist, method = "ward.D2")
+heat.cor <- cor(t(heat.dat), method = "pearson")
+heat.cor.hr <- hclust(as.dist(1-heat.cor), method = "complete")
+par(mfrow = c(4,2))
+
+groups <- cutree(heat.hr, k = 7)
+# plot(as.dendrogram(heat.hr), main = "Distance Cluster")
+# plot(as.dendrogram(heat.cor.hr), main = "Correlation Cluster")
+
+for (i in 1:7){
+  ind <- groups == i
+  group.dat <- heat.dat[ind, ]
+  do_heatmap(group.dat, title = paste("Cluster ", i, sep = ""))
+}
+
+
+
+```
+
+
+```{r}
+clust.centroid = function(i, dat, clusters) {
+  ind = (clusters == i)
+  colMeans(dat[ind,])
+}
+Clustcentroids <- sapply(levels(factor(groups)), clust.centroid, heat.dat, groups)
+
+centroid.melt <- melt(Clustcentroids)
+colnames(centroid.melt) <- c("Sample", "Cluster", "value")
+centroid.mt  <- centroid.melt[grep("mt", centroid.melt$Sample), ]
+centroid.mt$day <- str_match(centroid.mt$Sample, pattern= "\\.d(.+)\\.")[,2]
+centroid.mt.1 <- centroid.mt[centroid.mt$Cluster == 1, ]
+
+for (i in 1:7){
+  centroid.df <- subset(centroid.melt, Cluster == i)
+  centroid.df$day <- str_match(centroid.df$Sample, pattern= "\\.d(.+)\\.")[,2]
+  centroid.df$delivery <- str_match(centroid.df$Sample, pattern="^(.*)\\..*\\.")[,2]
+  centroid.df <- centroid.df[5:nrow(centroid.df), ]
+  
+  p1 <- ggplot(centroid.mt, aes(x = day, y = value, group= delivery, colour=as.factor(delivery))) + 
+    geom_point() +
+    geom_smooth(se = FALSE, alpha=0.1, method = "loess", span=0.75) +
+    xlab("Time") +
+    ylab("Expression") +
+    labs(title= "Cluster Expression by Time",color = "Cluster")
+  
+  plot(p1)
+}
+
+```
+
+```{r}
+
+```
+

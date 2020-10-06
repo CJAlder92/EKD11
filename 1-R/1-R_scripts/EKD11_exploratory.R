@@ -47,7 +47,7 @@ txi$length[txi$length==0] <- 1
 
 
 ## Create DESeq2 object
-dat <- DESeqDataSetFromTximport(txi, design, ~ grp + delivery) # To make Full rank model - Testing with controls removed to check for changes
+dat <- DESeqDataSetFromTximport(txi, design, ~ grp) # To make Full rank model - Testing with controls removed to check for changes
 rowData(dat) <- gtf.dat[rownames(dat),c("gene_id","gene_name","gene_source","gene_biotype","GRCm38")];
 
 
@@ -187,10 +187,10 @@ for (gid in deg.genes){
     cnt.dat  <- plotCounts(dds, which(rownames(dds) %in% gid), intgroup = c("day","delivery"), returnData = TRUE);
     #cnt.dat$day <- as.numeric(as.character(cnt.dat$day))
     cnt.plot <- ggplot(cnt.dat, aes(x = day, y = count, color = delivery, fill=delivery, group = delivery)) + geom_point() + geom_smooth(se = FALSE, alpha=0.1, method = "loess", span=0.75);
-    cnt.plot <- cnt.plot + ggtitle(sym) + ylab("normalised count") + xlab("day");
+    cnt.plot <- cnt.plot + ggtitle("ENSMUSG00000022965") + ylab("normalised count") + xlab("day");
     #cnt.plot <- cnt.plot + scale_y_log10();
     cnt.cols <- c("mosquito" = "firebrick", "blood" = "darkblue", "naive" = "#E69F00", 'recent_blood' = 'forestgreen')
-    cnt.plot <- cnt.plot + scale_colour_manual(values = pca.cols)
+    cnt.plot <- cnt.plot + scale_colour_manual(values = cnt.cols)
     png(file=paste(results.dir,"2-gene_profiles/",sym,".png",sep=''),height=500,width=700);
     print(cnt.plot);
     dev.off();
@@ -200,7 +200,7 @@ for (gid in deg.genes){
 
 ## Checking sample distances for outliers
 
-sampledist <- dist(t(assay(rld)))
+sampledist <- dist(t(assay(vsd)))
 sampledist.matrix <- as.matrix(sampledist)
 ht <- Heatmap(sampledist.matrix,
               name = 'sample_cor',

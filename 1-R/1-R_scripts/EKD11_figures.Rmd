@@ -182,7 +182,15 @@ p.1 <- plot_ly(data = pca.df) %>%
                    yaxis = list(title = paste("PC2:", round(pca.val[[2]], 2)*100, "%", sep = " ")))
 
 p.1
+Sys.setenv("PATH" = paste(Sys.getenv("PATH"), "/anaconda3/bin", sep = .Platform$path.sep)) ## To run orca
+orca(p.1, file="../../2-results/PC1_PC2.pdf") # Orca will append to WD (no absolute path)
 
+# if ( !require(RSelenium) ) {
+#   install.packages("RSelenium", repos = "https://cloud.r-project.org/")
+# }
+# p.1 %>% export(file = "test.svg",
+#          selenium = RSelenium::rsDriver(browser = "chrome"))
+# orca(p.1, file="../../2-results/PC1_PC2.png") # Orca will append to WD (no absolute paths)
 ```  
 
 ```{r pca-2}
@@ -210,7 +218,10 @@ p.2 <- plot_ly(data = pca.df) %>%
             layout(xaxis = list(title = paste("PC1:", round(pca.val[[1]], 2)*100, "%", sep = " ")),
                    yaxis = list(title = paste("PC3:", round(pca.val[[3]], 2)*100, "%", sep = " ")))
 
-# p.2
+p.2
+Sys.setenv("PATH" = paste(Sys.getenv("PATH"), "/anaconda3/bin", sep = .Platform$path.sep)) ## To run orca
+orca(p.2, file="../../2-results/PC1_PC3.pdf") # Orca will append to WD (no absolute path)
+
 ```
 
 ```{r pca-3}
@@ -239,6 +250,8 @@ p.3 <- plot_ly(data = pca.df) %>%
                    yaxis = list(title = paste("PC3:", round(pca.val[[3]], 2)*100, "%", sep = " ")))
 
 # p.3
+Sys.setenv("PATH" = paste(Sys.getenv("PATH"), "/anaconda3/bin", sep = .Platform$path.sep)) ## To run orca
+orca(p.3, file="../../2-results/PC2_PC3.pdf") # Orca will append to WD (no absolute path)
 
 ```
 
@@ -675,5 +688,72 @@ for (i in c(1,2,3,4,6)){
 })
 
 ```
+```{r innate-heatmap}
+  # heat.dat   <- as.matrix(assay(vsd)[mvn.early.list, ]);
+# sample.remove <- grep("d4|d6", colnames(heat.dat), value = TRUE)
+# heat.dat <- heat.dat[ , !colnames(heat.dat) %in% sample.remove]
+# heat.dat   <- t(apply(heat.dat,1,function(x){((x-mean(x,na.rm=TRUE))/sd(x,na.rm=TRUE))}));
 
+heat.dat   <- as.matrix(tpm.db[mvn.early.list, ]);
+heat.dat   <- log(heat.dat + 1)
+sample.remove <- grep("d4|d6", colnames(heat.dat), value = TRUE)
+heat.dat <- heat.dat[ , !colnames(heat.dat) %in% sample.remove]
+rownames(heat.dat) <- gtf.dat[rownames(heat.dat), "gene_name"];
+
+heat.dat
+
+
+
+#order so days are together 
+heat.list <- colnames(heat.dat);
+heat.list <- as.data.frame(heat.list);
+heat.list$day <- ifelse(grepl("naive", heat.list$heat.list),
+                        0,
+                        str_match(string=heat.list$heat.list, pattern= "\\.d(.+)\\.")[,2]);
+heat.list$delivery <- ifelse(grepl("naive", heat.list$heat.list),
+                             "naive",
+                             str_match(string=heat.list$heat.list, pattern="^(.*)\\..*\\.")[,2]);
+heat.list$delivery <- ordered(factor(heat.list$delivery, levels= c('naive', 'mt', 'sbp', 'rtmt')))
+heat.list$rep <- as.integer(str_match(string=heat.list$heat.list, pattern=".*r(.)$")[,2]);
+heat.list <- heat.list[order(as.numeric(heat.list$day), as.numeric(as.factor(heat.list$delivery)), heat.list$rep),];
+heat.list
+heat.list <- as.vector(heat.list$heat.list);
+
+
+heat.dat <- heat.dat[,heat.list] # Use the same col order as the for the zscore heatmap
+
+
+ht <- Heatmap(heat.dat,
+              name = "log(tpm+1)",
+              show_row_names          = TRUE,
+              show_column_names       = TRUE,
+              column_names_side       = "bottom",
+              show_column_dend        = FALSE,
+              show_row_dend           = FALSE, 
+              cluster_columns         = FALSE,
+              rect_gp                 = gpar(col = "white", lwd = 1),
+              row_dend_width          = unit(30, "mm"),
+              column_dend_height      = unit(30, "mm"),
+              show_heatmap_legend     = TRUE,
+              clustering_distance_rows = 'pearson',
+              column_names_max_height = unit(8, "cm"),
+              row_names_gp            = gpar(fontsize = 4),
+              column_names_gp         = gpar(fontsize = 10),
+              # split                   = split.vec, #This would use vector I created above to split and cluster the genes
+              # top_annotation          = ha1,
+              # bottom_annotation       = anno_bottom,
+              # col                     = colorRamp2(c(min(heat.dat), 0, max(heat.dat)), rev(colorRampPalette(brewer.pal(9, "RdBu"))(3))));
+              col                     = viridis::viridis(100));
+
+group <- c(0,4,16,28,40)
+pdf(paste(results.dir,"mvn_early_hm_w_naive_tpm_viridis.pdf",sep=''),width=15,height=30);
+ht
+decorate_heatmap_body("log(tpm+1)", c(for(d in seq(0, length(heat.list), 4)){
+  grid.lines(x=c(d/40, d/40), y=c(0,1), gp= gpar(col = 'black', lty="solid", lwd=2))},
+  grid.lines(y=c(0,0), x=c(0,1), gp= gpar(col = 'black', lty='solid', lwd=2)),
+  grid.lines(y=c(1,1), x=c(0,1), gp= gpar(col = 'black', lty='solid', lwd=2))), slice = 1)
+dev.off();
+
+heat.dat
+```
 

@@ -1,0 +1,526 @@
+---
+title: "Modular Analysis "
+author: "Chris Alder"
+date: "25/03/2020"
+output: 
+  html_document:
+    toc: true
+    self_contained: true
+---
+
+This is a report of the modular analysis on the EKD11 transcriptomics dataset/
+
+I have used the Singhania/O'Garra blood modules, using Qusage to quantify the relative encrihment of the modules.
+
+Qusage will assess the mean expression of all genes in a geneset (module) within a treatment group and compare against a control group, and output the log2Fold Enrichment of for each module.
+
+### Revisions
+I have changed the filtering process from P value < 0.05 to FDR < 0.05. 
+
+I have also added a comparison of RMT and SBP to look to see whether subtle differences could be identified through modular analysis. 
+
+
+## Setting directories for Data
+
+This will load the necessarys packages for the analysis, as well as load the module data.
+
+This analysis requires us to have loaded the samples into DESeq2 to identify the genes found to be differentially expressed (DE) in each comparison, as well as for a log transformed normalised count matrix (normalised to library size). 
+```{r workspace, message=FALSE}
+rm(list = ls())
+
+# Libraries
+library(DESeq2)
+library(ComplexHeatmap)
+library(tidyverse)
+library(qusage)
+library(ggplot2)
+library(reshape2)
+library(RColorBrewer)
+library(scales)
+
+nf.dir      <- "/Users/alderc/1-projects/CAMP/1-AS_timecourse/2-EKD11/1-Pipeline/1-Nextflow/"
+work.dir    <- "/Users/alderc/1-projects/1-PIR_project/3-EKD11_AS_Early_TP/"
+r.dir       <- paste(work.dir, "1-R/",sep='') #change once refactor is completed
+tmp.dir     <- paste(work.dir,"tmp/",sep='')
+data.dir    <- paste(work.dir,"4-data/",sep='')
+results.dir <- paste(work.dir,"2-results_2020/",sep='')
+genome.dir  <- "/Users/alderc/1-projects/9-Data/1-Reference_genomes/1-Mus_musculus/"
+
+
+module.anno <- read.csv(file=paste(data.dir, '/modular_analysis/Annotation of Blood modules.csv', sep=''),
+                        header=TRUE,
+                        sep=',');
+module.dat <- read.csv(file=paste(data.dir, '/modular_analysis/Blood modules.csv', sep=''),
+                       header=TRUE,
+                       sep=',');
+
+count.dat <- read.table(file= paste(results.dir, 'genes.vst_counts_with_controls.xls.gz', sep=''),
+                       header=TRUE,
+                       sep='\t');
+# Load DESeq results list
+load(paste(r.dir, "Projects/results.Rdata", sep = ""))
+
+deg.list <- lapply(res.list, function(x){
+  x <- x[x$DEG, ]
+})
+
+
+#List of Module IDs
+module.num <- module.anno$X
+print(module.anno[, -2])
+```
+
+
+
+Transforming data to create Modules into Geneset format for Qusage
+
+```{r module_creation}
+module.geneset <- lapply(module.num, function(mod){
+  dat <- module.dat[module.dat$Module == mod, 'X']; 
+  dat <- dat[!is.na(dat)]
+  mod <- dat
+})
+
+names(module.geneset) <- paste(module.num, module.anno$Biological.process)
+
+
+#Check to see if Merge was correct
+for (mod in names(module.geneset)){
+  name <- str_split(mod, " ")[[1]]
+  anno <- as.numeric(module.anno[module.anno$X == name[1], 'Number.of.genes']);
+  if (length(module.geneset[[mod]]) == anno){
+    print(paste("Geneset", mod, 'contains correct number of genes:', anno, sep=' '))
+  } else {
+    print('Module gene number does not match')
+  }
+}
+
+module.geneset.names <- lapply(module.geneset, functon(x){
+  gtf.dat[x, "gene_name"]
+})
+module.df <- data.frame(module = names(module.geneset))
+module.df$genes <- sapply(module.geneset, function(x){
+  gene_name <- gtf.dat[x, "gene_name"]
+  paste(gene_name, collapse = ", ")
+})
+
+write.table(module.df, file = paste(data.dir, "blood_module_gene_list.tsv", sep = ""), sep = "\t", quote = F, row.names = F)
+```
+
+Now we format the rlog data to the format we need
+
+```{r data_manipulation}
+## Trimming data
+rownames(count.dat) <- count.dat$gene_id
+sample.cols <- grep(pattern = '^naive|d.\\.', x = names(count.dat), value = TRUE)
+count.mat <- count.dat[ , sample.cols];
+```
+
+## Modular Quantification
+
+For this analysis, I have compared each transmission group separately against the control (i.e MT vs Naive, SBP vs Naive and RTMT vs Naive).
+
+### Overview
+Briefly, the script will compare the treatment and control on a individual timepoint (e.g. Day 1), to calculate the fold enrichment of the module, once each module enrichment score is complete it will move onto the next timepoint until all calculations are completed. Qusage will output a log fold enrichment score for each module, as well as p-value for the comparison. Modules with p-value > 0.05 were removed from further analysis. 
+
+Finally, the script will look at all the genes within a module, and look to see whether they were DE within the similar comparisons done within DESeq2, and return the proportion of genes within the module that were DE. 
+
+
+```{r}
+# Load Qusage reults (If run already)
+if(file.exists(paste(r.dir, "Projects/qusage_results.Rdata", sep = ""))){
+  load(paste(r.dir, "Projects/qusage_results.Rdata", sep = ""))
+}
+
+```
+
+
+
+### MT vs Naive
+
+```{r modular_analysis_MTvN, fig.height = 12, fig.width = 8}
+mvn.cols <- grepl(pattern = "naive|^mt", x= names(count.mat));
+mvn.mat <- count.mat[, mvn.cols];
+
+if(!exists("results.mvn")){
+  results.mvn <- lapply(c(1,2,3,4,6), function(d){
+    cols <- grepl(pattern = paste("d", d ,"|naive", sep=""), x = names(mvn.mat))
+    dat <- mvn.mat[, cols]
+    print(names(dat))
+    labels <- sapply(names(dat), function(x){
+      ifelse(grepl(pattern = "mt", x = x), "mt","naive")
+    })
+    contrast = "mt-naive";
+    qusage(dat, labels, contrast, module.geneset, n.points = 2^16)
+  })
+  names(results.mvn) <- c("Day1", "Day2", "Day3", "Day4", "Day6")
+}
+
+qusage.mvn <- lapply(names(results.mvn), function(x){
+  df <- qsTable(results.mvn[[x]], number = 41)
+  df$log.fold.change <- ifelse(df$p.Value < 0.05, df$log.fold.change, NA)
+  df <- df[ ,c(1,2)]
+  colnames(df) <- c("Module", paste(x, "_FC", sep = ""))
+  df
+})
+
+qusage.mvn.all <- Reduce(function(x,y) merge(x = x, y = y, by = "Module", no.dups=T), 
+       qusage.mvn)
+qusage.mvn.all <- qusage.mvn.all[match(names(module.geneset), qusage.mvn.all$Module), ]
+qusage.mvn.all$Module <- factor(qusage.mvn.all$Module, levels = qusage.mvn.all$Module)
+
+qusage.mvn.melt <- reshape2::melt(qusage.mvn.all, id.vars = "Module")
+qusage.mvn.melt$prop <-apply(qusage.mvn.melt, 1, function(prop){
+  if (!is.na(prop[["value"]])){
+  mod <- prop[[1]]
+  day <- as.numeric(str_match(string = prop[2], pattern = "[0-9]"))
+  geneset <- module.geneset[[mod]]
+  num.genes <- length(geneset)
+  deg.name <- grep(pattern = paste('^mt\\.', day, '_vs_naive', sep='')  , x = names(deg.list), value = TRUE);
+  deg <- deg.list[[deg.name]]
+  deg <- deg[geneset, ] %>% drop_na()
+  output <- nrow(deg) / num.genes} else {output <- NA}
+  output
+})
+
+x <- ggplot(qusage.mvn.melt, aes(x = variable, y = reorder(Module, desc(Module)))) + 
+  ggtitle('Mosquito Transmission') + xlab('Day') + ylab('Module') + 
+  scale_x_discrete(labels= c(1,2,3,4,6)) +
+  geom_count(aes(size = prop, colour = value), na.rm = TRUE) +
+  labs(size = "Proportion of DEG in Module", colour = 'log2 Fold Change') +
+  scale_color_gradientn(colours = rev(brewer.pal(11, "RdBu")),values = rescale(c(-0.5,0,1.25)), limits = c(-0.5,1.25)) +
+  scale_size_area(max_size = 9) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill = 'white'),
+  plot.background = element_blank(),
+  legend.background = element_rect(fill = 'transparent'))
+
+x
+```
+
+Results of the modular analysis of Mosquito transmission vs Control. Analysis was performed on all timepoint:module combinations and comparisons with a p-value < 0.05 were removed. The colour of the bubble indicated the intensity of fold change with red showing an upregulation and blue showing a downregulation. Size of the bubble indicates how many genes within a module were DE during that timepoint:module combination.
+
+
+### SBP vs Naive
+
+```{r modular_analysis_SBPvN, fig.height = 12, fig.width = 8}
+svn.cols <- grepl(pattern = "naive|^sbp", x= names(count.mat));
+svn.mat <- count.mat[, svn.cols];
+
+if(!exists("results.svn")){
+  results.svn <- lapply(c(1,2,3,4,6), function(d){
+    cols <- grepl(pattern = paste("d", d ,"|naive", sep=""), x = names(svn.mat));
+    dat <- svn.mat[, cols]
+    print(names(dat))
+    labels <- sapply(names(dat), function(x){
+      ifelse(grepl(pattern = "sbp", x = x), "sbp","naive")
+    })
+    contrast = "sbp-naive";
+    qusage(dat, labels, contrast, module.geneset, n.points = 2^16);
+  })
+  names(results.svn) <- c("Day1", "Day2", "Day3", "Day4", "Day6")
+}
+
+qusage.svn <- lapply(names(results.svn), function(x){
+  df <- qsTable(results.svn[[x]], number = 41)
+  df$log.fold.change <- ifelse(df$p.Value < 0.05, df$log.fold.change, NA)
+  df <- df[ ,c(1,2)]
+  colnames(df) <- c("Module", paste(x, "_FC", sep = ""))
+  df
+})
+
+qusage.svn.all <- Reduce(function(x,y) merge(x = x, y = y, by = "Module", no.dups=T), 
+       qusage.svn)
+qusage.svn.all <- qusage.svn.all[match(names(module.geneset), qusage.svn.all$Module), ]
+qusage.svn.all$Module <- factor(qusage.svn.all$Module, levels = qusage.svn.all$Module)
+
+qusage.svn.melt <- reshape2::melt(qusage.svn.all, id.vars = "Module")
+qusage.svn.melt$prop <-apply(qusage.svn.melt, 1, function(prop){
+  if (!is.na(prop[["value"]])){
+  mod <- prop[[1]]
+  day <- as.numeric(str_match(string = prop[2], pattern = "[0-9]"))
+  geneset <- module.geneset[[mod]]
+  num.genes <- length(geneset)
+  deg.name <- grep(pattern = paste('^sbp\\.', day, '_vs_naive', sep='')  , x = names(deg.list), value = TRUE);
+  deg <- deg.list[[deg.name]]
+  deg <- deg[geneset, ] %>% drop_na()
+  output <- nrow(deg) / num.genes} else {output <- NA}
+  output
+})
+
+x <- ggplot(qusage.svn.melt, aes(x = variable, y = reorder(Module, desc(Module)))) + 
+  ggtitle('Serially Blood Passaged') + xlab('Day') + ylab('Module') + 
+  scale_x_discrete(labels= c(1,2,3,4,6)) +
+  geom_count(aes(size = prop, colour = value), na.rm = TRUE) +
+  labs(size = "Proportion of DEG in Module", colour = 'log2 Fold Change') +
+  scale_color_gradientn(colours = rev(brewer.pal(11, "RdBu")),values = rescale(c(-0.5,0,1.25)), limits = c(-0.5,1.25)) +
+  scale_size_area(max_size = 9) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill = 'white'),
+  plot.background = element_blank(),
+  legend.background = element_rect(fill = 'transparent'))
+
+x
+```
+
+
+Results of the modular analysis of Serially Blood Passaged vs Control. Analysis was performed on all timepoint:module combinations and comparisons with a p-value < 0.05 were removed. The colour of the bubble indicated the intensity of fold change with red showing an upregulation and blue showing a downregulation. Size of the bubble indicates how many genes within a module were DE during that timepoint:module combination.
+
+
+### RTMT vs Naive
+
+```{r modular_analysis_RTMTvN, fig.height = 12, fig.width = 8}
+rvn.cols <- grepl(pattern = "naive|^rtmt", x= names(count.mat));
+rvn.mat <- count.mat[, rvn.cols];
+
+if(!exists("results.rvn")){
+  results.rvn <- lapply(c(1,2,3,4,6), function(d){
+    cols <- grepl(pattern = paste("d", d ,"|naive", sep=""), x = names(rvn.mat));
+    dat <- rvn.mat[, cols]
+    print(names(dat))
+    labels <- sapply(names(dat), function(x){
+      ifelse(grepl(pattern = "rtmt", x = x), "rtmt","naive")
+    })
+    print(labels)
+    contrast = "rtmt-naive";
+    qusage(dat, labels, contrast, module.geneset, n.points = 2^16);
+  })
+  names(results.rvn) <- c("Day1", "Day2", "Day3", "Day4", "Day6")
+}
+
+qusage.rvn <- lapply(names(results.rvn), function(x){
+  df <- qsTable(results.rvn[[x]], number = 41)
+  df$log.fold.change <- ifelse(df$p.Value < 0.05, df$log.fold.change, NA)
+  df <- df[ ,c(1,2)]
+  colnames(df) <- c("Module", paste(x, "_FC", sep = ""))
+  df
+})
+
+qusage.rvn.all <- Reduce(function(x,y) merge(x = x, y = y, by = "Module", no.dups=T), 
+       qusage.rvn)
+qusage.rvn.all <- qusage.rvn.all[match(names(module.geneset), qusage.rvn.all$Module), ]
+qusage.rvn.all$Module <- factor(qusage.rvn.all$Module, levels = qusage.rvn.all$Module)
+
+qusage.rvn.melt <- reshape2::melt(qusage.rvn.all, id.vars = "Module")
+qusage.rvn.melt$prop <-apply(qusage.rvn.melt, 1, function(prop){
+  if (!is.na(prop[["value"]])){
+  mod <- prop[[1]]
+  day <- as.numeric(str_match(string = prop[2], pattern = "[0-9]"))
+  geneset <- module.geneset[[mod]]
+  num.genes <- length(geneset)
+  deg.name <- grep(pattern = paste('^rtmt\\.', day, '_vs_naive', sep='')  , x = names(deg.list), value = TRUE);
+  deg <- deg.list[[deg.name]]
+  deg <- deg[geneset, ] %>% drop_na()
+  output <- nrow(deg) / num.genes} else {output <- NA}
+  output
+})
+
+x <- ggplot(qusage.rvn.melt, aes(x = variable, y = reorder(Module, desc(Module)))) + 
+  ggtitle('Recently Mosquito Transmitted') + xlab('Day') + ylab('Module') + 
+  scale_x_discrete(labels= c(1,2,3,4,6)) +
+  geom_count(aes(size = prop, colour = value), na.rm = TRUE) +
+  labs(size = "Proportion of DEG in Module", colour = 'log2 Fold Change') +
+  scale_color_gradientn(colours = rev(brewer.pal(11, "RdBu")),values = rescale(c(-0.5,0,1.25)), limits = c(-0.5,1.25)) +
+  scale_size_area(max_size = 9) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill = 'white'),
+  plot.background = element_blank(),
+  legend.background = element_rect(fill = 'transparent'))
+
+x
+```
+
+Results of the modular analysis of Recently Mosquito transmission vs Control. Analysis was performed on all timepoint:module combinations and comparisons with a p-value < 0.05 were removed. The colour of the bubble indicated the intensity of fold change with red showing an upregulation and blue showing a downregulation. Size of the bubble indicates how many genes within a module were DE during that timepoint:module combination.
+
+
+### RMT vs SBP 
+
+```{r modular_analysis_RMTvSBP, fig.height = 12, fig.width = 8}
+rvs.cols <- grepl(pattern = "sbp|^rtmt", x= names(count.mat));
+rvs.mat <- count.mat[, rvs.cols];
+
+if(!exists("results.rvs")){
+  results.rvs <- lapply(c(1,2,3,4,6), function(d){
+    cols <- grepl(pattern = paste("d", d, sep=""), x = names(rvs.mat));
+    dat <- rvs.mat[, cols]
+    print(names(dat))
+    labels <- sapply(names(dat), function(x){
+      ifelse(grepl(pattern = "rtmt", x = x), "rtmt","sbp")
+    })
+    print(labels)
+    contrast = "rtmt-sbp";
+    qusage(dat, labels, contrast, module.geneset, n.points = 2^16);
+  })
+  names(results.rvs) <- c("Day1", "Day2", "Day3", "Day4", "Day6")
+}
+
+qusage.rvs <- lapply(names(results.rvs), function(x){
+  df <- qsTable(results.rvs[[x]], number = 41)
+  df$log.fold.change <- ifelse(df$FDR < 0.05, df$log.fold.change, NA)
+  df <- df[ ,c(1,2)]
+  colnames(df) <- c("Module", paste(x, "_FC", sep = ""))
+  df
+})
+
+qusage.rvs.all <- Reduce(function(x,y) merge(x = x, y = y, by = "Module", no.dups=T), 
+       qusage.rvs)
+qusage.rvs.all <- qusage.rvs.all[match(names(module.geneset), qusage.rvs.all$Module), ]
+qusage.rvs.all$Module <- factor(qusage.rvs.all$Module, levels = qusage.rvs.all$Module)
+
+qusage.rvs.melt <- reshape2::melt(qusage.rvs.all, id.vars = "Module")
+qusage.rvs.melt$prop <-apply(qusage.rvs.melt, 1, function(prop){
+  if (!is.na(prop[["value"]])){
+  mod <- prop[[1]]
+  day <- as.numeric(str_match(string = prop[2], pattern = "[0-9]"))
+  geneset <- module.geneset[[mod]]
+  num.genes <- length(geneset)
+  deg.name <- grep(pattern = paste('^rtmt\\.', day, '_vs_sbp', sep='')  , x = names(deg.list), value = TRUE);
+  deg <- deg.list[[deg.name]]
+  deg <- deg[geneset, ] %>% drop_na()
+  output <- nrow(deg) / num.genes} else {output <- NA}
+  output
+})
+
+x <- ggplot(qusage.rvs.melt, aes(x = variable, y = reorder(Module, desc(Module)))) + 
+  ggtitle('Recently Mosquito Transmitted vs Serially Blood Passaged') + xlab('Day') + ylab('Module') + 
+  scale_x_discrete(labels= c(1,2,3,4,6)) +
+  geom_count(aes(colour = value), na.rm = TRUE) +
+  # geom_count(data = subset(qusage.rvs.melt, !is.na(value)), aes(colour = value)) +
+  # # geom_count(data = subset(qusage.rvs.melt,  is.na(value)), aes(colour = NA)) +
+  labs(colour = 'log2 Fold Change') +
+  scale_color_gradientn(colours = rev(brewer.pal(11, "RdBu")),values = rescale(c(-0.5,0,1.25)), limits = c(-0.5,1.25), na.value = "transparent") +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill = 'white'),
+  plot.background = element_blank(),
+  legend.background = element_rect(fill = 'transparent'))
+
+x
+```
+
+
+
+
+### Day 3 - All transmissions
+
+```{r, fig.height = 5, fig.width = 4}
+qusage.mvn.melt$transmission <- "MT"
+qusage.rvn.melt$transmission <- "RMT"
+qusage.svn.melt$transmission <- "SBP"
+
+qusage.all.melt <- do.call("rbind", list(qusage.mvn.melt, qusage.rvn.melt , qusage.svn.melt))
+
+qusage.all.d3 <- qusage.all.melt[qusage.all.melt$variable == "Day3_FC", ]
+
+x <- ggplot(qusage.all.d3, aes(x = transmission, y = reorder(Module, desc(Module)))) + 
+  ggtitle('Day 3') + xlab('Transmission') + ylab('Module') + 
+  geom_count(aes(size = prop, colour = value), na.rm = TRUE) +
+  labs(size = "Proportion of DEG in Module", colour = 'log2 Fold Change') +
+  scale_color_gradientn(colours = rev(brewer.pal(11, "RdBu")),values = rescale(c(-0.5,0,1.25)), limits = c(-0.5,1.25)) +
+  scale_size_area(max_size = 9) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill = 'white'),
+  plot.background = element_blank(),
+  legend.background = element_rect(fill = 'transparent'),
+  text = element_text(size=14, face = "bold"),
+  plot.title = element_text(hjust = 0.5))
+
+pdf(paste(results.dir, "Modular_analysis_d3.pdf", sep = ""), height = 12, width = 9)
+plot(x)
+dev.off()
+
+```
+
+### Day 4 - All transmissions
+
+```{r, fig.height = 6, fig.width = 4}
+qusage.all.d4 <- qusage.all.melt[qusage.all.melt$variable == "Day4_FC", ]
+
+
+x <- ggplot(qusage.all.d4, aes(x = transmission, y = reorder(Module, desc(Module)))) + 
+  ggtitle('Day 4 ') + xlab('Transmission') + ylab('Module') + 
+  geom_count(aes(size = prop, colour = value), na.rm = TRUE) +
+  labs(size = "Proportion of DEG in Module", colour = 'Enrichment score') +
+  scale_color_gradientn(colours = rev(brewer.pal(11, "RdBu")),values = rescale(c(-0.5,0,1.25)), limits = c(-0.5,1.25)) +
+  scale_size_area(max_size = 9) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill = 'white'),
+  plot.background = element_blank(),
+  legend.background = element_rect(fill = 'transparent'),
+  text = element_text(size=14, face = "bold"),
+  plot.title = element_text(hjust = 0.5))
+
+
+pdf(paste(results.dir, "Modular_analysis_d4.pdf", sep = ""), height = 12, width = 9)
+plot(x)
+dev.off()
+
+```
+ 
+ 
+### Day 6 - All transmissions
+
+
+```{r, fig.height = 6, fig.width = 4}
+qusage.all.d6 <- qusage.all.melt[qusage.all.melt$variable == "Day6_FC", ]
+
+x <- ggplot(qusage.all.d6, aes(x = transmission, y = reorder(Module, desc(Module)))) + 
+  ggtitle('Day 6 ') + xlab('Transmission') + ylab('Module') + 
+  geom_count(aes(size = prop, colour = value), na.rm = TRUE) +
+  labs(size = "Proportion of DEG in Module", colour = 'Enrichment score') +
+  scale_color_gradientn(colours = rev(brewer.pal(11, "RdBu")),values = rescale(c(-0.5,0,1.25)), limits = c(-0.5,1.25))+
+  scale_size_area(max_size = 9) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill = 'white'),
+  plot.background = element_blank(),
+  legend.background = element_rect(fill = 'transparent'),
+  text = element_text(size=14, face = "bold"),
+  plot.title = element_text(hjust = 0.5))
+
+
+pdf(paste(results.dir, "Modular_analysis_d6.pdf", sep = ""), height = 12, width = 9)
+plot(x)
+dev.off()
+
+x
+```
+
+```{r}
+qusage.all.melt$variable <- gsub("_FC" , "", qusage.all.melt$variable)
+
+x <- ggplot(qusage.all.melt, aes(x = transmission, y = reorder(Module, desc(Module)))) + 
+  xlab('Transmission') + ylab('Module') + 
+  geom_count(aes(size = prop, colour = value), na.rm = TRUE) +
+  labs(size = "Proportion of DEG in Module", colour = 'Enrichment score') +
+  scale_color_gradientn(colours = rev(brewer.pal(11, "RdBu")),values = rescale(c(-0.5,0,1.25)), limits = c(-0.5,1.25)) +
+  scale_size_area(max_size = 9) +
+  facet_wrap( ~ variable, ncol = 5) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill = 'white'),
+  plot.background = element_blank(),
+  legend.background = element_rect(fill = 'transparent'),
+  text = element_text(size=12, face = "bold"),
+  plot.title = element_text(hjust = 0.5),
+  panel.spacing =unit(.05, "lines"),
+  panel.border = element_rect(color = "black", fill = NA, size = 1), 
+  strip.background = element_rect(color = "black", size = 1))
+
+  
+pdf(paste(results.dir, "Modular_analysis_facet.pdf", sep = ""), height = 12, width = 12)
+plot(x)
+dev.off()
+```
+ 
+```{r save}
+if(!file.exists(paste(r.dir, "Projects/qusage_results.Rdata", sep = ""))){
+save(results.mvn, results.svn, results.rvn, results.rvs, file = paste(r.dir, "Projects/qusage_results.Rdata", sep = ""))
+}
+```
+
